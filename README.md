@@ -32,15 +32,9 @@ It achieves competitive performance with **very low parameter count (2,460)**, m
 - numpy
 - torchsummary (optional, for model summary)
 
-Install everything with:
+## Install everything with:
 ```bash
 pip install -r requirements.txt
 
 ---
 
-## ▶️ How to Run
-
-Clone the repository:
-```bash
-git clone https://github.com/USERNAME/thesis-hybrid-lnn.git
-cd thesis-hybrid-lnn
