@@ -35,3 +35,12 @@ It achieves competitive performance with **very low parameter count (2,460)**, m
 Install everything with:
 ```bash
 pip install -r requirements.txt
+
+---
+
+## ▶️ How to Run
+
+Clone the repository:
+```bash
+git clone https://github.com/USERNAME/thesis-hybrid-lnn.git
+cd thesis-hybrid-lnn
