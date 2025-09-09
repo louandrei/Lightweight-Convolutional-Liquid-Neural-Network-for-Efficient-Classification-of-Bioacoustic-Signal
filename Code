@@ -1,0 +1,667 @@
+import os
+import glob
+import warnings
+import time
+import re # Import re for regex parsing filenames
+import random
+from collections import Counter
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau # Added for better convergence
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import StratifiedKFold, train_test_split # Import train_test_split
+from sklearn.preprocessing import LabelBinarizer
+
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, roc_auc_score, confusion_matrix, roc_curve)
+from sklearn.exceptions import UndefinedMetricWarning
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Import torchaudio globally
+try:
+    import torchaudio
+    import torchaudio.transforms as T
+except ImportError:
+    raise ImportError("torchaudio is required for audio loading. Please install it (e.g., pip install torchaudio).")
+
+# Import torchsummary for model summary tables
+try:
+    from torchsummary import summary
+except ImportError:
+    print("torchsummary not found. Please install it using 'pip install torchsummary' for model summaries.")
+    summary = None
+
+# Paths
+# IMPORTANT: Update this path to your actual dataset location
+DATASET_PATH = "C:/Users/User/Documents/Beebioacoustic/archive" # Placeholder, user needs to update this
+
+# --- BINARY CLASSIFICATION SETUP (2 CLASSES) ---
+# Define binary classification class names and their integer mapping
+CLASS_NAMES = ["nobee", "bee"]
+CLASS_MAPPING = {name: i for i, name in enumerate(CLASS_NAMES)}
+NUM_CLASSES = len(CLASS_NAMES)
+
+# Keywords for binary class label assignment (using regex for flexibility)
+# Regex patterns to match variations in filenames
+label_keywords_map = {
+    "nobee": [r"NO_QueenBee", r"Missing Queen"],
+    "bee": [r"QueenBee", r"Active[\s-]*Day", r"Active"]
+}
+# --- END BINARY CLASSIFICATION SETUP ---
+
+# Dataset Parameters
+SAMPLE_RATE = 16000
+SEGMENT_LEN_SEC = 2.0
+OVERLAP_SEC = 1.0
+
+# Data loading and Slicing Function
+def load_data_and_slice(path, segment_len_seconds, overlap_seconds):
+    """
+    Loads all WAV files from a directory, assigns labels based on filename,
+    and slices the raw audio into fixed-length segments.
+    """
+    wav_files = glob.glob(os.path.join(path, "*.wav"))
+    sliced_data = []
+    total_wav_files = len(wav_files)
+
+    segments_per_class_initial = {name: 0 for name in CLASS_NAMES}
+
+    segment_samples = int(segment_len_seconds * SAMPLE_RATE)
+    overlap_samples = int(overlap_seconds * SAMPLE_RATE)
+    step_samples = segment_samples - overlap_samples
+
+    print(f"Slicing audio into {segment_len_seconds}s segments with {overlap_seconds}s overlap ({segment_samples} samples, step {step_samples} samples).")
+    print(f"Found {total_wav_files} WAV files to process.")
+
+    start_time_overall = time.time()
+
+    for i, wav_path in enumerate(wav_files):
+        base_filename = os.path.splitext(os.path.basename(wav_path))[0]
+        assigned_label = None
+
+        found_match = False
+        for class_name_str in CLASS_NAMES:
+            keywords = label_keywords_map.get(class_name_str, [])
+            for keyword_pattern in keywords:
+                if re.search(keyword_pattern, base_filename, re.IGNORECASE):
+                    assigned_label = CLASS_MAPPING[class_name_str]
+                    found_match = True
+                    break
+            if found_match:
+                break
+
+        num_segments_from_file = 0
+
+        if assigned_label is not None:
+            try:
+                waveform, sr = torchaudio.load(wav_path)
+                if waveform.size(0) > 1:
+                    waveform = waveform.mean(dim=0, keepdim=True)
+                if sr != SAMPLE_RATE:
+                    waveform = torchaudio.transforms.Resample(sr, SAMPLE_RATE)(waveform)
+                waveform = waveform.squeeze(0)
+
+                total_samples = waveform.size(0)
+
+                for start_sample in range(0, total_samples, step_samples):
+                    end_sample = start_sample + segment_samples
+                    current_slice = waveform[start_sample:min(end_sample, total_samples)]
+
+                    if current_slice.size(0) < segment_samples:
+                        min_valid_slice_len = int(segment_samples * 0.5)
+                        if current_slice.size(0) < min_valid_slice_len and start_sample > 0:
+                            continue
+                        current_slice = nn.functional.pad(current_slice, (0, segment_samples - current_slice.size(0)))
+
+                    if current_slice.size(0) == segment_samples:
+                        sliced_data.append((current_slice, assigned_label))
+                        num_segments_from_file += 1
+                    segments_per_class_initial[CLASS_NAMES[assigned_label]] += 1
+
+            except Exception as e:
+                print(f"Error loading or slicing {wav_path}: {e}")
+        else:
+            print(f"Skipping {wav_path}: No recognized multi-class label in filename.")
+
+    end_time_overall = time.time()
+    print(f"\nFinished initial data loading and slicing.")
+    print(f"Generated {len(sliced_data)} segments from {total_wav_files} original files.")
+    print(f"Initial segments per class: {segments_per_class_initial}")
+    for class_name, count in segments_per_class_initial.items():
+        if count == 0:
+            print(f"WARNING: No segments found for class '{class_name}'. This class will not be trained or evaluated.")
+
+    print(f"Total time for load_data_and_slice: {end_time_overall - start_time_overall:.2f} seconds ({ (end_time_overall - start_time_overall)/60:.2f} minutes).")
+    return sliced_data
+
+# Data Augmentation (Added for improved robustness)
+class AddGaussianNoise(object):
+    def __init__(self, p=0.5, mean=0., std=0.005):
+        self.p = p
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, waveform):
+        if random.random() < self.p:
+            noise = torch.randn_like(waveform) * self.std + self.mean
+            return waveform + noise
+        return waveform
+
+# Custom Collate Function for Oversampling
+def OversampleTransform(batch):
+    """
+    A custom collate function to handle imbalanced datasets by oversampling
+    the minority classes to match the majority class.
+    """
+    inputs_list, labels_list = list(zip(*batch))
+
+    labels_tensor = torch.tensor(labels_list)
+    class_counts = Counter(labels_tensor.tolist())
+
+    if not class_counts:
+        return torch.empty(0), torch.empty(0)
+
+    max_count = max(class_counts.values())
+
+    new_inputs_list = []
+    new_labels_list = []
+
+    for class_label in sorted(class_counts.keys()):
+        current_count = class_counts[class_label]
+        duplication_factor = max(1, max_count // current_count)
+
+        indices_for_class = [i for i, label in enumerate(labels_list) if label == class_label]
+
+        for _ in range(duplication_factor):
+            for idx in indices_for_class:
+                new_inputs_list.append(inputs_list[idx])
+                new_labels_list.append(labels_list[idx])
+
+        remaining_to_add = max_count - (duplication_factor * current_count)
+        if remaining_to_add > 0:
+            random_extra_indices = random.sample(indices_for_class, remaining_to_add)
+            for idx in random_extra_indices:
+                new_inputs_list.append(inputs_list[idx])
+                new_labels_list.append(labels_list[idx])
+
+    combined = list(zip(new_inputs_list, new_labels_list))
+    random.shuffle(combined)
+    inputs_list_shuffled, labels_list_shuffled = zip(*combined)
+
+    inputs = torch.stack(inputs_list_shuffled)
+    labels = torch.tensor(labels_list_shuffled)
+
+    if inputs.shape[0] != labels.shape[0]:
+        raise ValueError(f"OversampleTransform: Mismatch in batch sizes. Inputs batch_size: {inputs.shape[0]}, Labels batch_size: {labels.shape[0]}")
+
+    return inputs, labels
+
+# BeeAudioDataset (MODIFIED to use RAW audio)
+class BeeAudioDataset(Dataset):
+    """
+    A PyTorch Dataset class to handle the sliced raw audio segments.
+    """
+    def __init__(self, data_list, augment_transform=None):
+        self.data_list = data_list
+        self.augment_transform = augment_transform
+
+    def __len__(self): return len(self.data_list)
+
+    def __getitem__(self, idx):
+        waveform, label = self.data_list[idx]
+        if self.augment_transform:
+            waveform = self.augment_transform(waveform)
+        # Add a channel dimension for the Conv1d layer (e.g., from [32000] to [1, 32000])
+        waveform = waveform.unsqueeze(0)
+        return waveform, label
+
+# --- Liquid Neural Network (LNN) Core Component ---
+class LiquidNeuron(nn.Module):
+    """
+    The core Liquid Neural Network neuron, implementing a continuous-time dynamical system.
+    """
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+
+        self.W = nn.Parameter(torch.randn(hidden_size, hidden_size) * 0.1)
+        self.U = nn.Parameter(torch.randn(hidden_size, input_size) * 0.1)
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        # Learnable time constants for the liquid dynamics
+        self.tau = nn.Parameter(torch.ones(hidden_size) * 0.5)
+
+    def forward(self, x, h_prev):
+        # The core LNN update rule: a continuous-time RNN approximation
+        dx = -h_prev + torch.tanh(F.linear(x, self.U) + F.linear(h_prev, self.W) + self.bias)
+        h = h_prev + (1.0 / self.tau) * dx
+        return h
+
+# --- Hybrid Model: 1D CNN Feature Extractor + LNN ---
+class HybridRawAudioLNN(nn.Module):
+    """
+    A hybrid model combining a 1D CNN for feature extraction on raw audio
+    with a Liquid Neural Network for temporal dynamics and classification.
+    """
+    def __init__(self, input_samples, hidden_size_liquid=8, num_classes=NUM_CLASSES):
+        super().__init__()
+        print(f"DEBUG: HybridRawAudioLNN initialized with num_classes={num_classes}")
+
+        # --- REDUCED PARAMETERS ---
+        # Reduced number of filters and layers to decrease parameter count
+        self.feature_extractor = nn.Sequential(
+            nn.Conv1d(1, 8, kernel_size=16, stride=4, padding=8),
+            nn.ReLU(),
+            nn.BatchNorm1d(8),
+            nn.MaxPool1d(kernel_size=4, stride=4),
+
+            nn.Conv1d(8, 16, kernel_size=16, stride=4, padding=8),
+            nn.ReLU(),
+            nn.BatchNorm1d(16),
+            nn.MaxPool1d(kernel_size=4, stride=4),
+            nn.Flatten()
+        )
+
+        # Calculate the flattened output size of the feature extractor
+        dummy_input = torch.randn(1, 1, input_samples)
+        with torch.no_grad():
+            flattened_size = self.feature_extractor(dummy_input).shape[1]
+
+        # The Liquid Neuron processes the flattened features
+        self.liquid_cell = LiquidNeuron(input_size=flattened_size, hidden_size=hidden_size_liquid)
+
+        # The final classifier head with reduced hidden layer size
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size_liquid, 16),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(16, num_classes)
+        )
+
+    def forward(self, x):
+        if x.dim() > 3:
+            # Handle potential extra dimensions from dataloader if needed
+            x = x.squeeze(2)
+
+        batch_size = x.shape[0]
+
+        # Extract features using the 1D CNN
+        features = self.feature_extractor(x)
+
+        # Pass features through the liquid cell
+        # Here, we assume a single time step for the liquid neuron based on the
+        # flattened output of the 1D CNN.
+        h = torch.zeros(batch_size, self.liquid_cell.hidden_size).to(x.device)
+        h = self.liquid_cell(features, h)
+
+        # Classify the final state of the liquid neuron
+        out = self.classifier(h)
+        return out
+
+# Training and Evaluation Functions
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    """Performs a single training epoch."""
+    model.train()
+    total_loss = 0
+    correct_preds = 0
+    total_samples = 0
+
+    for batch_idx, (inputs, labels) in enumerate(loader):
+        inputs, labels = inputs.to(device), labels.long().to(device)
+
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+
+        # Added gradient clipping here to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        optimizer.step()
+        total_loss += loss.item() * inputs.size(0)
+
+        # Calculate training accuracy
+        _, preds = torch.max(outputs, 1)
+        correct_preds += (preds == labels).sum().item()
+        total_samples += labels.size(0)
+
+    avg_loss = total_loss / total_samples
+    accuracy = correct_preds / total_samples
+    return avg_loss, accuracy
+
+def evaluate(model, loader, device):
+    """Performs evaluation on a validation or test set."""
+    model.eval()
+    all_labels, all_preds, all_probs_raw = [], [], []
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            probs = torch.softmax(outputs, dim=1)
+            preds = torch.argmax(probs, dim=1)
+
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+            all_probs_raw.extend(probs.cpu().numpy())
+
+    all_labels = np.array(all_labels)
+    all_preds = np.array(all_preds)
+    all_probs_raw = np.array(all_probs_raw)
+
+    # Calculate validation loss separately after evaluation
+    criterion = nn.CrossEntropyLoss(reduction='mean')
+    val_loss = 0.0
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.long().to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            val_loss += loss.item() * inputs.size(0)
+    val_loss /= len(loader.dataset)
+
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UndefinedMetricWarning)
+        acc = accuracy_score(all_labels, all_preds)
+        prec = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
+        rec = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+
+        auc = float('nan')
+        if NUM_CLASSES > 1 and len(np.unique(all_labels)) >= 2:
+            try:
+                # For binary classification, roc_auc_score expects probabilities of the positive class
+                if len(CLASS_NAMES) == 2:
+                    auc = roc_auc_score(all_labels, all_probs_raw[:, 1], average='weighted', labels=np.arange(NUM_CLASSES))
+                else:
+                    auc = roc_auc_score(all_labels, all_probs_raw, multi_class='ovr', average='weighted', labels=np.arange(NUM_CLASSES))
+            except ValueError as e:
+                print(f"Warning: Could not calculate multi-class AUC. Error: {e}")
+                auc = float('nan')
+
+    cm = confusion_matrix(all_labels, all_preds, labels=np.arange(NUM_CLASSES))
+
+    return {
+        "accuracy": acc, "precision": prec, "recall": rec,
+        "f1": f1, "auc": auc, "confusion_matrix": cm,
+        "labels": all_labels, "probs": all_probs_raw, "preds": all_preds,
+        "loss": val_loss
+    }
+
+# --- PLOTTING FUNCTIONS ---
+def plot_metrics(train_metrics, val_metrics, metric_name, title):
+    """Plots training and validation metrics over epochs."""
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_metrics, label=f'Training {metric_name}', marker='o')
+    plt.plot(val_metrics, label=f'Validation {metric_name}', marker='o')
+    plt.title(title)
+    plt.xlabel('Epoch')
+    plt.ylabel(metric_name)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_roc_curve_multi(true_labels, predicted_probs, classes, title="Multi-Class ROC Curve"):
+    """Plots a one-vs-rest ROC curve for a multi-class problem."""
+    label_binarizer = LabelBinarizer()
+    y_one_hot = label_binarizer.fit_transform(true_labels)
+
+    # For binary classification, y_one_hot will be (n_samples, 1)
+    if y_one_hot.shape[1] == 1:
+        y_one_hot = np.hstack((1 - y_one_hot, y_one_hot))
+
+    plt.figure(figsize=(10, 8))
+    for i in range(len(classes)):
+        try:
+            fpr, tpr, _ = roc_curve(y_one_hot[:, i], predicted_probs[:, i])
+            auc_score = roc_auc_score(y_one_hot[:, i], predicted_probs[:, i])
+            plt.plot(fpr, tpr, linestyle='--', label=f'{classes[i]} (AUC = {auc_score:.2f})')
+        except ValueError as e:
+            print(f"Warning: Could not plot ROC curve for class '{classes[i]}'. Error: {e}")
+
+    plt.plot([0, 1], [0, 1], 'k--', label='Chance Level (AUC = 0.5)')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(title)
+    plt.legend(loc='lower right')
+    plt.grid(True)
+    plt.show()
+
+def plot_confusion_matrix(cm, classes, title="Confusion matrix"):
+    plt.figure(figsize=(8, 7))
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title(title)
+    plt.colorbar()
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes, rotation=45, ha='right')
+    plt.yticks(tick_marks, classes)
+
+    fmt = 'd'
+    thresh = cm.max() / 2.
+
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, format(cm[i, j], fmt),
+                     ha="center", va="center",
+                     color="white" if cm[i, j] > thresh else "black")
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.tight_layout()
+    plt.show()
+
+def print_model_summary(model, input_shape_for_summary, device, name):
+    if summary is not None:
+        print(f"\n--- Model Summary: {name} ---")
+        try:
+            summary(model, input_shape_for_summary, device=device.type)
+        except Exception as e:
+            print(f"    Could not generate full summary for {name}. Error: {e}")
+            print(f"    Manual parameter count for {name}: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+        print("------------------------------")
+    else:
+        print("Install 'torchsummary' to see model parameter tables.")
+
+# Experiment runner
+def run_experiment(name, model_class, epochs=10, batch_size=32, lr=0.001, hidden_size_liquid=8, num_folds=5, oversample_minority=True, input_samples=None):
+    print(f"\n▶ Running: {name} with {num_folds}-Fold Cross-Validation for Binary Classification")
+
+    all_sliced_data_list = load_data_and_slice(DATASET_PATH, SEGMENT_LEN_SEC, OVERLAP_SEC)
+
+    if not all_sliced_data_list:
+        print(f"No sliced data segments found with recognized multi-class labels. Exiting {name} experiment.")
+        return
+
+    all_labels_for_split = np.array([item[1] for item in all_sliced_data_list])
+
+    print(f"Overall sliced dataset label distribution: {Counter(all_labels_for_split)}")
+    if len(np.unique(all_labels_for_split)) < NUM_CLASSES:
+        print(f"Warning: Fewer than {NUM_CLASSES} classes found in the sliced dataset. Multi-classification may be impacted.")
+
+    train_val_data_list, test_data_list, train_val_labels_skf, test_labels_skf = train_test_split(
+        all_sliced_data_list, all_labels_for_split, test_size=0.2, stratify=all_labels_for_split, random_state=42
+    )
+
+    print("\n--- Dataset Split Summary ---")
+    print(f"Training + Validation set size: {len(train_val_data_list)}")
+    print(f"Test set size: {len(test_data_list)}")
+    print(f"Test set label distribution: {Counter(test_labels_skf)}")
+    print("-----------------------------\n")
+
+    skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=42)
+
+    fold_accuracies, fold_f1_scores, fold_auc_scores = [], [], []
+
+    # --- Lists to accumulate data across all folds for overall results
+    all_val_labels_across_folds = []
+    all_val_preds_across_folds = []
+    all_val_probs_across_folds = []
+    # ---
+
+    model = None
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(train_val_data_list)), train_val_labels_skf)):
+        print(f"\n--- Fold {fold + 1}/{num_folds} for {name} ---")
+
+        train_data_list = [train_val_data_list[i] for i in train_idx]
+        val_data_list = [train_val_data_list[i] for i in val_idx]
+
+        train_labels_fold = [item[1] for item in train_data_list]
+        val_labels_fold = [item[1] for item in val_data_list]
+        print(f"    Train split label distribution (Fold {fold+1}): {Counter(train_labels_fold)}")
+        print(f"    Validation split label distribution (Fold {fold+1}): {Counter(val_labels_fold)}")
+
+        train_ds = BeeAudioDataset(train_data_list, augment_transform=AddGaussianNoise())
+        val_ds = BeeAudioDataset(val_data_list)
+
+        NUM_DATALOADER_WORKERS = 0
+
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                                  num_workers=NUM_DATALOADER_WORKERS,
+                                  collate_fn=OversampleTransform if oversample_minority else None,
+                                  pin_memory=False)
+
+        val_loader = DataLoader(val_ds, batch_size=batch_size,
+                                num_workers=NUM_DATALOADER_WORKERS,
+                                pin_memory=False)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"    Using device: {device}")
+
+        model = model_class(input_samples=input_samples, hidden_size_liquid=hidden_size_liquid, num_classes=NUM_CLASSES).to(device)
+
+        if fold == 0 and summary is not None:
+            input_shape_for_summary = (1, input_samples)
+            print_model_summary(model, input_shape_for_summary, device, name)
+
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1) # Added label smoothing
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+
+        best_val_loss = float('inf')
+        patience_counter = 0
+        PATIENCE = 10
+        train_losses = []
+        train_accuracies = []
+        val_losses = []
+        val_accuracies = []
+
+        for epoch in range(1, epochs + 1):
+            start_time_epoch = time.time()
+            train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device)
+            val_metrics = evaluate(model, val_loader, device)
+            scheduler.step(val_metrics['loss'])
+
+            train_losses.append(train_loss)
+            train_accuracies.append(train_acc)
+            val_losses.append(val_metrics['loss'])
+            val_accuracies.append(val_metrics['accuracy'])
+
+            epoch_time = time.time() - start_time_epoch
+            print(f"    Epoch {epoch}/{epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.4f} | Time: {epoch_time:.2f}s")
+
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print(f"    Early stopping triggered at epoch {epoch} due to no improvement in validation loss.")
+                break
+
+        plot_metrics(train_losses, val_losses, 'Loss', f'Loss per Epoch (Fold {fold + 1})')
+        plot_metrics(train_accuracies, val_accuracies, 'Accuracy', f'Accuracy per Epoch (Fold {fold + 1})')
+
+        fold_accuracies.append(val_metrics['accuracy'])
+        fold_f1_scores.append(val_metrics['f1'])
+        if not np.isnan(val_metrics['auc']):
+            fold_auc_scores.append(val_metrics['auc'])
+
+        # --- Accumulate labels, predictions, and probabilities from this fold
+        all_val_labels_across_folds.extend(val_metrics['labels'])
+        all_val_preds_across_folds.extend(val_metrics['preds'])
+        all_val_probs_across_folds.extend(val_metrics['probs'])
+        # ---
+
+    mean_accuracy = np.mean(fold_accuracies)
+    std_accuracy = np.std(fold_accuracies)
+    mean_f1 = np.mean(fold_f1_scores)
+    std_f1 = np.std(fold_f1_scores)
+    overall_auc = np.mean(fold_auc_scores) if fold_auc_scores else float('nan')
+
+    print(f"\n--- Final {name} Cross-Validation Results ---")
+    print(f"Mean Accuracy: {mean_accuracy:.4f} (+/- {std_accuracy:.4f})")
+    print(f"Mean F1 Score: {mean_f1:.4f} (+/- {std_f1:.4f})")
+    if not np.isnan(overall_auc):
+        print(f"Overall AUC: {overall_auc:.4f}")
+
+    # --- Plot OVERALL confusion matrix
+    print("\n--- Plotting Overall Confusion Matrix from All Validation Folds ---")
+    overall_cm = confusion_matrix(all_val_labels_across_folds, all_val_preds_across_folds, labels=np.arange(NUM_CLASSES))
+    plot_confusion_matrix(overall_cm, CLASS_NAMES, title=f"Overall {name} Confusion Matrix (All Validation Folds)")
+    # ---
+
+    print("\n--- Final Test Set Evaluation ---")
+    if model is not None:
+        test_ds = BeeAudioDataset(test_data_list)
+        test_loader = DataLoader(test_ds, batch_size=batch_size, num_workers=NUM_DATALOADER_WORKERS, pin_memory=False)
+        test_metrics = evaluate(model, test_loader, device)
+
+        print(f"Test Accuracy: {test_metrics['accuracy']:.4f}")
+        print(f"Test F1 Score: {test_metrics['f1']:.4f}")
+        if not np.isnan(test_metrics['auc']):
+            print(f"Test AUC: {test_metrics['auc']:.4f}")
+
+        plot_confusion_matrix(test_metrics['confusion_matrix'], CLASS_NAMES, title=f"{name} Final Test Confusion Matrix")
+        
+        # --- Plot ROC curve for the FINAL test set
+        if not np.isnan(test_metrics['auc']):
+            plot_roc_curve_multi(test_metrics['labels'], test_metrics['probs'], CLASS_NAMES, title=f"{name} Final Test ROC Curve")
+        # ---
+
+    return {
+        "mean_accuracy": mean_accuracy,
+        "std_accuracy": std_accuracy,
+        "mean_f1": mean_f1,
+        "std_f1": std_f1,
+        "overall_auc": overall_auc,
+        "test_metrics": test_metrics
+    }
+
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    # Define the experiment for the Hybrid LNN model
+    experiment = {
+        "model_class": HybridRawAudioLNN,
+        "epochs": 20,
+        "batch_size": 64,
+        "lr": 0.0005,
+        "hidden_size_liquid": 8,
+        "num_folds": 5,
+        "oversample_minority": True,
+        "input_samples": int(SEGMENT_LEN_SEC * SAMPLE_RATE)
+    }
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Run the single, specified experiment
+    start_time = time.time()
+    try:
+        results = run_experiment("Hybrid LNN with Raw Audio", **experiment)
+        print("\n--- Experiment Complete ---")
+        print(f"Results for Hybrid LNN:")
+        print(f"  Mean Cross-Validation Accuracy: {results['mean_accuracy']:.4f}")
+        print(f"  Mean Cross-Validation F1 Score: {results['mean_f1']:.4f}")
+        print("\n--- Final Test Results ---")
+        print(f"  Test Accuracy: {results['test_metrics']['accuracy']:.4f}")
+        print(f"  Test F1 Score: {results['test_metrics']['f1']:.4f}")
+    except Exception as e:
+        print(f"An error occurred during the Hybrid LNN experiment: {e}")
+    end_time = time.time()
+    print(f"Total experiment time: {end_time - start_time:.2f} seconds.")
