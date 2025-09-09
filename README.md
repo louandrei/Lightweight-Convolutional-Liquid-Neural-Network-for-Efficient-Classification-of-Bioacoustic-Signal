@@ -32,7 +32,7 @@ You can install dependencies with:
 ```bash
 pip install -r requirements.txt
 
-[▶️ How to Run](#️-how-to-run)
+## ▶️ How to Run
 
 Clone the repository:
 
@@ -54,7 +54,7 @@ Evaluate:
 
 python evaluate.py --model hybrid_lnn
 
-📊 Datasets
+## 📊 Datasets
 
 To Bee or Not to Bee dataset → used for binary classification (Bee vs. NoBee).
 
@@ -62,7 +62,7 @@ ASC24 dataset → used for multi-class classification (dog, cow, frog sounds).
 
 If datasets are too large for GitHub, you can download them from [https://www.kaggle.com/datasets/chrisfilo/to-bee-or-no-to-bee and https://www.kaggle.com/datasets/haithammoh/sounds-of-animals].
 
-📈 Results
+## 📈 Results
 
 Hybrid LNN (Proposed): 89.57% accuracy (Bee dataset) with only 2,460 parameters.
 
@@ -70,7 +70,7 @@ Outperforms raw-audio baselines (RNN, LNN) and approaches spectrogram-based CNN/
 
 Generalizes well to multi-class classification (ASC24 dataset): 85.38% accuracy across three animal sound categories.
 
-📖 Citation
+## 📖 Citation
 
 If you use this repository, please cite:
 
