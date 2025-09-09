@@ -83,3 +83,13 @@ The model was evaluated on the ["To Bee or Not to Bee" dataset](https://www.kagg
 * **Test F1-score:** ~89.58%
 
 The Hybrid LNN approaches CNN/LSTM performance while being >10x smaller in parameters.
+
+---
+
+## 📖 Citation
+
+If you use this repository, please cite:
+
+Lou Andrei Rabanzo. "Lightweight Convolutional Liquid Neural Network for Efficient Classification of Bioacoustic Signal." Master's Thesis, 2025.
+
+Repository: https://github.com/louandrei/Lightweight-Convolutional-Liquid-Neural-Network-for-Efficient-Classification-of-Bioacoustic-Signal
