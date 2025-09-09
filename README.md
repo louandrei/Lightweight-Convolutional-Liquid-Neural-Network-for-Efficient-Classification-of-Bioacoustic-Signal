@@ -32,9 +32,53 @@ It achieves competitive performance with **very low parameter count (2,460)**, m
 - numpy
 - torchsummary (optional, for model summary)
 
-## Install everything with:
+### Install everything with:
+
 ```bash
 pip install -r requirements.txt
+```
+---
+
+## ▶️ How to Run
+
+1.  **Clone the repository:**
+
+    ```bash
+    git clone https://github.com/USERNAME/thesis-hybrid-lnn.git
+    cd thesis-hybrid-lnn
+    ```
+
+2.  **Update the dataset path in `hybrid_lnn_binary.py`:**
+
+    ```python
+    DATASET_PATH = "path/to/your/wav/files"
+    ```
+
+    The code expects `.wav` audio files named with keywords like **QueenBee** or **No_QueenBee** for automatic labeling.
+
+3.  **Run the script:**
+
+    ```bash
+    python hybrid_lnn_binary.py
+    ```
+
+This will train and evaluate the Hybrid LNN using **5-fold cross-validation** and output metrics.
 
 ---
 
+
+## 📊 Dataset
+
+The model was evaluated on the ["To Bee or Not to Bee" dataset](https://www.kaggle.com/datasets/chrisfilo/to-bee-or-no-to-bee).
+
+> Note: Dataset files are not included in this repository due to size. Please download and place them in your chosen `DATASET_PATH`.
+
+---
+
+## 📈 Results
+
+* **Cross-validation accuracy:** ~89.57%
+* **Cross-validation F1-score:** ~89.58%
+* **Test accuracy:** (to be updated after final run)
+
+The Hybrid LNN approaches CNN/LSTM performance while being >10x smaller in parameters.
