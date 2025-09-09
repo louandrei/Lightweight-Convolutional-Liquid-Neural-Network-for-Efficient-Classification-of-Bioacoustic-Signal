@@ -32,7 +32,7 @@ You can install dependencies with:
 ```bash
 pip install -r requirements.txt
 
-▶️ How to Run
+[▶️ How to Run](#️-how-to-run)
 
 Clone the repository:
 
