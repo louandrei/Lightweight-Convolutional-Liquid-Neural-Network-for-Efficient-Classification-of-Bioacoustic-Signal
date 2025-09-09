@@ -60,7 +60,7 @@ To Bee or Not to Bee dataset → used for binary classification (Bee vs. NoBee).
 
 ASC24 dataset → used for multi-class classification (dog, cow, frog sounds).
 
-If datasets are too large for GitHub, you can download them from [Google Drive/Zenodo link here].
+If datasets are too large for GitHub, you can download them from [https://www.kaggle.com/datasets/chrisfilo/to-bee-or-no-to-bee and https://www.kaggle.com/datasets/haithammoh/sounds-of-animals].
 
 📈 Results
 
