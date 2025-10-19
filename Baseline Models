@@ -1,0 +1,821 @@
+import os
+import glob
+import warnings
+import time
+import re # Import re for regex parsing filenames
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import StratifiedKFold
+
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, roc_auc_score, confusion_matrix)
+from sklearn.exceptions import UndefinedMetricWarning
+
+import matplotlib.pyplot as plt
+import numpy as np
+from collections import Counter
+import random
+
+# Import torchaudio globally
+try:
+    import torchaudio
+    import torchaudio.transforms as T
+except ImportError:
+    raise ImportError("torchaudio is required for audio loading. Please install it (e.g., pip install torchaudio).")
+
+
+# Import torchsummary for model summary tables
+try:
+    from torchsummary import summary
+except ImportError:
+    print("torchsummary not found. Please install it using 'pip install torchsummary' for model summaries.")
+    summary = None
+
+# Paths
+# IMPORTANT: Update this path to your actual dataset location
+DATASET_PATH = "C:/Users/User/Documents/Beebioacoustic/archive" # Placeholder, user needs to update this
+
+# --- PRIMARY BINARY CLASSIFICATION SETUP (2 CLASSES) ---
+# Define primary binary classification class names and their integer mapping
+CLASS_NAMES = ["nobee", "bee"] # Reconfigured for binary classification
+CLASS_MAPPING = {name: i for i, name in enumerate(CLASS_NAMES)}
+NUM_CLASSES = len(CLASS_NAMES) # Now explicitly 2
+
+# Keywords for multi-class label assignment (using regex for flexibility)
+# Regex patterns to match variations in filenames
+label_keywords_map = {
+    "nobee": [r"NO_QueenBee", r"Missing Queen"],  # Grouped "Missing Queen" and "NO_QueenBee" into 'nobee'
+    "bee": [r"QueenBee", r"Active[\s-]*Day"] # Grouped "QueenBee" and "Active Day" into 'bee'
+}
+# --- END PRIMARY BINARY CLASSIFICATION SETUP ---
+
+
+# Dataset Parameters
+SAMPLE_RATE = 16000
+SEGMENT_LEN_SEC = 1.0 # All models will process segments of this length
+OVERLAP_SEC = 0.5
+FRAME_SIZE = 400 # Size of chunks fed to initial linear layer for LNN, RNN, LSTM (when using raw audio)
+
+# Mel Spectrogram Parameters (for CNN and LSTM)
+N_MELS = 64
+N_FFT = 1024
+HOP_LENGTH = 512
+
+# Pre-calculate expected Mel Spectrogram dimensions for model instantiation
+# For a 1-second segment (16000 samples)
+# Number of frames in Mel Spectrogram = floor((total_samples - N_FFT) / HOP_LENGTH) + 1
+# = floor(14976 / 512) + 1 = 29 + 1 = 30
+# Based on runtime error, it appears to be 32 frames for 16000 samples with these settings.
+MEL_SPEC_FRAMES = 32 # Adjusted based on observed runtime behavior for CNN input
+
+
+# Mel Spectrogram Transformation Class
+class MelSpectrogramTransform(nn.Module):
+    def __init__(self, sample_rate, n_fft, hop_length, n_mels):
+        super().__init__()
+        self.mel_spectrogram = T.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=n_mels
+        )
+        self.amplitude_to_db = T.AmplitudeToDB()
+
+    def forward(self, waveform):
+        # Ensure waveform is 2D (channels, samples) for torchaudio transforms
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0) # Add channel dimension
+
+        mel_spec = self.mel_spectrogram(waveform)
+        mel_spec_db = self.amplitude_to_db(mel_spec)
+        return mel_spec_db # Shape: (channels, n_mels, time_frames)
+
+
+# Data loading and Slicing Function
+def load_data_and_slice(path, segment_len_seconds, overlap_seconds):
+    wav_files = glob.glob(os.path.join(path, "*.wav"))
+    sliced_data = []
+    total_wav_files = len(wav_files)
+    
+    # Track segments per class to report missing classes
+    segments_per_class_initial = {name: 0 for name in CLASS_NAMES}
+
+    segment_samples = int(segment_len_seconds * SAMPLE_RATE)
+    overlap_samples = int(overlap_seconds * SAMPLE_RATE)
+    step_samples = segment_samples - overlap_samples
+
+    print(f"Slicing audio into {segment_len_seconds}s segments with {overlap_seconds}s overlap ({segment_samples} samples, step {step_samples} samples).")
+    print(f"Found {total_wav_files} WAV files to process.")
+
+    start_time_overall = time.time()
+
+    for i, wav_path in enumerate(wav_files):
+        start_time_file = time.time()
+        base_filename = os.path.splitext(os.path.basename(wav_path))[0]
+        assigned_label = None
+
+        # Iterate through defined classes to find a match using regex
+        found_match = False
+        for class_name_str in CLASS_NAMES:
+            keywords = label_keywords_map.get(class_name_str, [])
+            for keyword_pattern in keywords:
+                if re.search(keyword_pattern, base_filename, re.IGNORECASE): # Use re.search and ignore case
+                    assigned_label = CLASS_MAPPING[class_name_str]
+                    found_match = True
+                    break
+            if found_match:
+                break
+
+        num_segments_from_file = 0
+
+        if assigned_label is not None:
+            try:
+                waveform, sr = torchaudio.load(wav_path)
+                if waveform.size(0) > 1:
+                    waveform = waveform.mean(dim=0, keepdim=True)
+                if sr != SAMPLE_RATE:
+                    waveform = torchaudio.transforms.Resample(sr, SAMPLE_RATE)(waveform)
+                waveform = waveform.squeeze(0) # Remove channel dimension for raw processing initially
+
+                total_samples = waveform.size(0)
+
+                for start_sample in range(0, total_samples, step_samples):
+                    end_sample = start_sample + segment_samples
+                    current_slice = waveform[start_sample:min(end_sample, total_samples)]
+
+                    if current_slice.size(0) < segment_samples:
+                        min_valid_slice_len = int(segment_samples * 0.5)
+                        if current_slice.size(0) < min_valid_slice_len and start_sample > 0:
+                            continue
+                        current_slice = nn.functional.pad(current_slice, (0, segment_samples - current_slice.size(0)))
+
+                    if current_slice.size(0) == segment_samples:
+                        sliced_data.append((current_slice, assigned_label))
+                        num_segments_from_file += 1
+                        segments_per_class_initial[CLASS_NAMES[assigned_label]] += 1 # Increment count for assigned class
+                    
+                # --- DEBUG PRINT FOR EACH FILE ---
+                if assigned_label is not None:
+                    print(f"    DEBUG: File '{base_filename}.wav' -> Assigned Label: {CLASS_NAMES[assigned_label]} ({assigned_label}) - Segments: {num_segments_from_file}")
+                else:
+                    print(f"    DEBUG: File '{base_filename}.wav' -> NO LABEL ASSIGNED")
+                # --- END DEBUG PRINT ---
+
+            except Exception as e:
+                print(f"Error loading or slicing {wav_path}: {e}")
+        else:
+            print(f"Skipping {wav_path}: No recognized multi-class label in filename.")
+
+        end_time_file = time.time()
+        print(f"Processed file {i+1}/{total_wav_files} ({base_filename}.wav) - {num_segments_from_file} segments generated. Time: {end_time_file - start_time_file:.2f}s")
+        if (i + 1) % 100 == 0:
+            elapsed_overall = time.time() - start_time_overall
+            print(f"--- Processed {i+1}/{total_wav_files} files so far. Elapsed time: {elapsed_overall:.2f}s ({elapsed_overall/60:.2f} minutes).")
+
+
+    end_time_overall = time.time()
+    print(f"\nFinished initial data loading and slicing.")
+    print(f"Generated {len(sliced_data)} segments from {total_wav_files} original files.")
+    print(f"Initial segments per class: {segments_per_class_initial}") # Report initial counts
+    for class_name, count in segments_per_class_initial.items():
+        if count == 0:
+            print(f"WARNING: No segments found for class '{class_name}'. This class will not be trained or evaluated.")
+
+    print(f"Total time for load_data_and_slice: {end_time_overall - start_time_overall:.2f} seconds ({ (end_time_overall - end_time_overall)/60:.2f} minutes).")
+    return sliced_data
+
+
+# Custom Transform for Oversampling
+class OversampleTransform:
+    def __init__(self):
+        pass
+
+    def __call__(self, batch):
+        inputs_list, labels_list = list(zip(*batch)) # Ensure mutable lists
+
+        labels_tensor = torch.tensor(labels_list)
+        class_counts = Counter(labels_tensor.tolist())
+        
+        if not class_counts: # Handle empty batch case
+            return torch.empty(0), torch.empty(0)
+
+        max_count = max(class_counts.values())
+        
+        new_inputs_list = []
+        new_labels_list = []
+
+        for class_label in sorted(class_counts.keys()): # Iterate through classes
+            current_count = class_counts[class_label]
+            duplication_factor = max(1, max_count // current_count) # How many times to duplicate
+            
+            # Identify indices for the current class
+            indices_for_class = [i for i, label in enumerate(labels_list) if label == class_label]
+            
+            for _ in range(duplication_factor):
+                for idx in indices_for_class:
+                    new_inputs_list.append(inputs_list[idx])
+                    new_labels_list.append(labels_list[idx])
+            
+            # Add remaining samples if max_count is not a perfect multiple
+            remaining_to_add = max_count - (duplication_factor * current_count)
+            if remaining_to_add > 0:
+                random_extra_indices = random.sample(indices_for_class, remaining_to_add)
+                for idx in random_extra_indices:
+                    new_inputs_list.append(inputs_list[idx])
+                    new_labels_list.append(labels_list[idx])
+
+        # Shuffle the oversampled batch to mix original and duplicated samples
+        combined = list(zip(new_inputs_list, new_labels_list))
+        random.shuffle(combined)
+        inputs_list_shuffled, labels_list_shuffled = zip(*combined)
+
+        inputs = torch.stack(inputs_list_shuffled)
+        labels = torch.tensor(labels_list_shuffled)
+
+        # Explicit check to ensure matching batch dimensions
+        if inputs.shape[0] != labels.shape[0]:
+            raise ValueError(f"OversampleTransform: Mismatch in batch sizes. Inputs batch_size: {inputs.shape[0]}, Labels batch_size: {labels.shape[0]}")
+        
+        return inputs, labels
+
+# Data Augmentation Functions for Raw Audio
+class AudioAugmentations:
+    def __init__(self, sample_rate, noise_std=0.005, gain_range=(0.7, 1.3), shift_max_percentage=0.05):
+        self.sample_rate = sample_rate
+        self.noise_std = noise_std
+        self.gain_range = gain_range
+        self.shift_max_samples = int(sample_rate * shift_max_percentage)
+
+    def add_noise(self, waveform):
+        noise = torch.randn_like(waveform) * self.noise_std
+        return waveform + noise
+
+    def random_gain(self, waveform):
+        gain = random.uniform(self.gain_range[0], self.gain_range[1])
+        return waveform * gain
+
+    def time_shift(self, waveform):
+        shift = random.randint(-self.shift_max_samples, self.shift_max_samples)
+        if shift == 0: return waveform
+
+        if shift > 0: # Shift right (pad beginning with zeros)
+            return torch.cat((torch.zeros(shift, device=waveform.device), waveform[:-shift]), dim=0)
+        else: # Shift left (pad end with zeros)
+            return torch.cat((waveform[-shift:], torch.zeros(-shift, device=waveform.device)), dim=0)
+
+    def __call__(self, waveform):
+        if random.random() < 0.6:
+            if random.random() < 0.5: waveform = self.add_noise(waveform)
+            if random.random() < 0.5: waveform = self.random_gain(waveform)
+            if random.random() < 0.5: waveform = self.time_shift(waveform)
+        return waveform
+
+# BeeAudioDataset - now handles both raw audio and Mel spectrograms
+class BeeAudioDataset(Dataset):
+    def __init__(self, data_list, feature_type="raw", augment=False, sample_rate=16000,
+                 n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS):
+        self.data_list = data_list
+        self.feature_type = feature_type 
+        self.sample_rate = sample_rate
+
+        self.augment = augment
+        if self.augment and self.feature_type == "raw": # Only augment raw audio
+            segment_len_samples = self.data_list[0][0].size(0) if self.data_list else SAMPLE_RATE
+            segment_len_seconds = segment_len_samples / SAMPLE_RATE
+            self.audio_augmentor = AudioAugmentations(
+                sample_rate=SAMPLE_RATE,
+                noise_std=0.005,
+                gain_range=(0.8, 1.2),
+                shift_max_percentage=0.05 / (segment_len_seconds / 1.0)
+            )
+        else:
+            self.audio_augmentor = None
+
+        if self.feature_type == "mel":
+            self.mel_spectrogram_transform = MelSpectrogramTransform(
+                sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
+            )
+        else:
+            self.mel_spectrogram_transform = None
+
+    def __len__(self): return len(self.data_list)
+
+    def __getitem__(self, idx):
+        waveform, label = self.data_list[idx]
+
+        if self.feature_type == "raw":
+            if self.augment and self.audio_augmentor:
+                waveform = self.audio_augmentor(waveform)
+            return waveform, label
+        elif self.feature_type == "mel":
+            if self.mel_spectrogram_transform:
+                # Mel spectrogram transform expects (channels, samples)
+                mel_spec = self.mel_spectrogram_transform(waveform)
+            # Squeeze the channel dimension if it's 1 and not needed for the model
+                # For CNN, it expects (batch, channels, n_mels, time_frames)
+                # For LSTM, it expects (batch, time_frames, n_mels)
+                # So we'll keep the channel dimension for CNN and remove for LSTM
+                return mel_spec, label
+            else:
+                raise ValueError("Mel spectrogram transform not initialized for 'mel' feature_type.")
+        else:
+            raise ValueError(f"Unsupported feature_type: {self.feature_type}. Must be 'raw' or 'mel'.")
+
+
+# --- Liquid Neural Network (LNN) Model Definition ---
+class LiquidNeuron(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+
+        self.W = nn.Parameter(torch.randn(hidden_size, hidden_size) * 0.1)
+        self.U = nn.Parameter(torch.randn(hidden_size, input_size) * 0.1)
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        self.tau = nn.Parameter(torch.ones(hidden_size) * 0.5)
+
+    def forward(self, x, h_prev):
+        dx = -h_prev + torch.tanh(F.linear(x, self.U) + F.linear(h_prev, self.W) + self.bias)
+        h = h_prev + (1.0 / self.tau) * dx
+        return h
+
+class RawAudioLNN(nn.Module):
+    def __init__(self, frame_size=FRAME_SIZE, initial_proj_dim=32, hidden_size_liquid=16, hidden_size_classifier=32, num_classes=NUM_CLASSES):
+        super().__init__()
+        self.frame_size = frame_size
+
+        self.linear_proj = nn.Linear(frame_size, initial_proj_dim)
+        self.liquid_cell = LiquidNeuron(input_size=initial_proj_dim, hidden_size=hidden_size_liquid)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size_liquid, hidden_size_classifier),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_size_classifier, num_classes)
+        )
+
+    def forward(self, x):
+        batch_size, total_samples = x.shape
+        num_frames = total_samples // self.frame_size
+        x = x[:, :num_frames * self.frame_size]
+        x = x.view(batch_size, num_frames, self.frame_size)
+
+        x = self.linear_proj(x)
+
+        h = torch.zeros(batch_size, self.liquid_cell.hidden_size).to(x.device)
+        for t in range(x.size(1)):
+            h = self.liquid_cell(x[:, t, :], h)
+        out = self.classifier(h)
+        return out
+
+# --- Recurrent Neural Network (RNN) Model Definition ---
+class RawAudioRNN(nn.Module):
+    def __init__(self, frame_size=FRAME_SIZE, initial_proj_dim=32, rnn_hidden_size=32, num_classes=NUM_CLASSES):
+        super().__init__()
+        self.frame_size = frame_size
+        self.rnn_hidden_size = rnn_hidden_size
+
+        self.linear_proj = nn.Linear(frame_size, initial_proj_dim)
+        self.rnn = nn.RNN(input_size=initial_proj_dim, hidden_size=rnn_hidden_size, batch_first=True)
+        self.classifier = nn.Sequential(
+            nn.Linear(rnn_hidden_size, rnn_hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(rnn_hidden_size, num_classes)
+        )
+
+    def forward(self, x):
+        batch_size, total_samples = x.shape
+        num_frames = total_samples // self.frame_size
+        x = x[:, :num_frames * self.frame_size]
+        x = x.view(batch_size, num_frames, self.frame_size)
+
+        x = self.linear_proj(x)
+
+        _, h_n = self.rnn(x)
+        
+        out = self.classifier(h_n.squeeze(0))
+
+        return out
+
+# --- Long Short-Term Memory (LSTM) Model Definition (Now with Mel Spectrogram Input) ---
+class MelAudioLSTM(nn.Module):
+    def __init__(self, lstm_input_size=N_MELS, lstm_hidden_size=64, num_classes=NUM_CLASSES):
+        super().__init__()
+        self.lstm_input_size = lstm_input_size
+        self.lstm_hidden_size = lstm_hidden_size
+
+        # LSTM directly takes Mel features as input
+        self.lstm = nn.LSTM(input_size=lstm_input_size, hidden_size=lstm_hidden_size, batch_first=True)
+        self.classifier = nn.Sequential(
+            nn.Linear(lstm_hidden_size, lstm_hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(lstm_hidden_size, num_classes)
+        )
+
+    def forward(self, x):
+        # Input x is (batch_size, channels, n_mels, time_frames) from MelSpectrogramTransform
+        # For LSTM, we need (batch_size, time_frames, n_mels)
+        # Assuming single channel, squeeze channel dim and permute
+        x = x.squeeze(1).permute(0, 2, 1) # (batch_size, time_frames, n_mels)
+
+        _, (h_n, c_n) = self.lstm(x)
+        
+        out = self.classifier(h_n.squeeze(0))
+
+        return out
+
+# --- Convolutional Neural Network (CNN) Model Definition (Now with Mel Spectrogram Input) ---
+class MelAudioCNN(nn.Module):
+    def __init__(self, num_classes=NUM_CLASSES):
+        super().__init__()
+        # Input to Conv2d is expected to be (batch_size, channels, height, width)
+        # Mel spectrogram is (channels, n_mels, time_frames)
+        self.features = nn.Sequential(
+            # Reduced out_channels to 4
+            nn.Conv2d(in_channels=1, out_channels=4, kernel_size=(5, 5), stride=(1, 1), padding=(2,2)), 
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 2)), 
+            # Reduced in_channels to 4 and out_channels to 4
+            nn.Conv2d(in_channels=4, out_channels=4, kernel_size=(3, 3), stride=(1, 1), padding=(1,1)), 
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 2))
+        )
+        
+        # Calculate the size of the flattened features after conv layers
+        # For N_MELS=64, MEL_SPEC_FRAMES=32 (adjusted)
+        # After first pool: (64/2, 32/2) = (32, 16)
+        # After second pool: (32/2, 16/2) = (16, 8)
+        # So, 4 channels * 16 height * 8 width = 512
+        self._num_features = self._get_conv_output((1, N_MELS, MEL_SPEC_FRAMES))
+
+        self.classifier = nn.Sequential(
+            # Reduced hidden layer size to 32
+            nn.Linear(self._num_features, 32), 
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(32, num_classes)
+        )
+
+    # Helper function to calculate conv output size dynamically
+    def _get_conv_output(self, shape):
+        batch_size = 1
+        input = torch.autograd.Variable(torch.rand(batch_size, *shape))
+        output_feat = self.features(input)
+        n_size = output_feat.data.view(batch_size, -1).size(1)
+        return n_size
+
+    def forward(self, x):
+        # Input x is (batch_size, channels, n_mels, time_frames)
+        x = self.features(x)
+        x = x.view(x.size(0), -1) # Flatten
+        out = self.classifier(x)
+        return out
+
+
+# Training and Evaluation Functions
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0
+    start_time_epoch = time.time()
+    for batch_idx, (inputs, labels) in enumerate(loader):
+        inputs, labels = inputs.to(device), labels.long().to(device)
+
+        optimizer.zero_grad()
+        outputs = model(inputs)
+
+        loss = criterion(outputs, labels)
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+
+        optimizer.step()
+        total_loss += loss.item() * inputs.size(0)
+
+        if (batch_idx + 1) % 100 == 0:
+            elapsed_time_batch_group = time.time() - start_time_epoch
+            print(f"            [train_one_epoch] Processed {batch_idx + 1}/{len(loader)} batches. Elapsed: {elapsed_time_batch_group:.2f}s")
+
+    return total_loss / len(loader.dataset)
+
+def evaluate(model, loader, device):
+    model.eval()
+    all_labels, all_preds, all_probs_raw = [], [], []
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            probs = torch.softmax(outputs, dim=1)
+            preds = torch.argmax(probs, dim=1)
+
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+            all_probs_raw.extend(probs.cpu().numpy())
+
+    all_labels = np.array(all_labels)
+    all_preds = np.array(all_preds)
+    all_probs_raw = np.array(all_probs_raw)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UndefinedMetricWarning)
+        acc = accuracy_score(all_labels, all_preds)
+        prec = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
+        rec = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+
+        auc = float('nan')
+        if NUM_CLASSES > 1 and len(np.unique(all_labels)) >= 2:
+            try:
+                auc = roc_auc_score(all_labels, all_probs_raw, multi_class='ovr', average='weighted', labels=np.arange(NUM_CLASSES))
+            except ValueError as e:
+                print(f"Warning: Could not calculate multi-class AUC. Error: {e}")
+                auc = float('nan')
+
+    cm = confusion_matrix(all_labels, all_preds)
+
+    return {
+        "accuracy": acc, "precision": prec, "recall": rec,
+        "f1": f1, "auc": auc, "confusion_matrix": cm,
+        "labels": all_labels, "probs": all_probs_raw, "preds": all_preds
+    }
+
+# Plot helpers
+def plot_confusion_matrix(cm, classes, title="Confusion matrix"):
+    plt.figure(figsize=(8, 7))
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title(title)
+    plt.colorbar()
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes, rotation=45, ha='right')
+    plt.yticks(tick_marks, classes)
+
+    fmt = 'd'
+    thresh = cm.max() / 2.
+
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, format(cm[i, j], fmt),
+                     ha="center", va="center",
+                     color="white" if cm[i, j] > thresh else "black")
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.tight_layout()
+    plt.show()
+
+
+# Helper to print model summary
+def print_model_summary(model, input_shape_for_summary, device, name, feature_type="raw"):
+    if summary is not None:
+        print(f"\n--- Model Summary: {name} ---")
+        try:
+            if name == "CNN": # CNN expects (channels, height, width) for Mel
+                summary(model, input_size=(1, N_MELS, MEL_SPEC_FRAMES), device=str(device))
+            elif name == "LSTM" or name == "RNN": # LSTM/RNN return (output, (h_n, c_n)) or (output, h_n)
+                # torchsummary has known issues with LSTM/RNN models returning complex tuples for summary. # We'll print manual parameter count instead.
+                print(f"    Note: `torchsummary` has known issues with LSTM/RNN models returning complex tuples. Skipping detailed summary.")
+                print(f"    Manual parameter count for {name}: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+            else: # LNN expects (total_samples) for raw audio
+                summary(model, input_size=input_shape_for_summary, device=str(device))
+        except Exception as e:
+            print(f"    Could not generate full summary for {name}. Error: {e}")
+            print(f"    Manual parameter count for {name}: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+        print("------------------------------")
+    else:
+        print("Install 'torchsummary' to see model parameter tables.")
+
+# Experiment runner
+def run_experiment(model_type, epochs=10, batch_size=32, lr=0.001, weight_decay=1e-5, dropout_prob=0.3, patience=10, min_delta=0.001, oversample_minority=True, use_augmentation=False, num_folds=5, **model_params):
+    print(f"\n▶ Running: {model_type} (Mode: {'Mel Spectrogram' if model_type in ['LSTM', 'CNN'] else 'raw audio'}) with {num_folds}-Fold Cross-Validation for {NUM_CLASSES}-Class Classification")
+    current_segment_len_sec = SEGMENT_LEN_SEC
+    # Determine feature_type for the dataset based on model_type
+    dataset_feature_type = "mel" if model_type in ["LSTM", "CNN"] else "raw"
+    all_sliced_data_list = load_data_and_slice(DATASET_PATH, current_segment_len_sec, OVERLAP_SEC)
+    if not all_sliced_data_list:
+        print(f"No sliced data segments found with recognized multi-class labels. Exiting {model_type} experiment.")
+        return
+    # --- NEW DEBUG: Explicitly count labels after slicing ---
+    explicit_label_counts = {name: 0 for name in CLASS_NAMES}
+    for _, label in all_sliced_data_list:
+        explicit_label_counts[CLASS_NAMES[label]] += 1
+    print(f"DEBUG: Explicit label counts after slicing: {explicit_label_counts}")
+    # --- END NEW DEBUG ---
+    all_labels_for_skf = np.array([item[1] for item in all_sliced_data_list])
+    print(f"Overall sliced dataset label distribution (using Counter): {Counter(all_labels_for_skf)}")
+    if len(np.unique(all_labels_for_skf)) < NUM_CLASSES:
+        print(f"WARNING: Fewer than {NUM_CLASSES} classes found in the sliced dataset after loading. This may impact evaluation.")
+    skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=42)
+    fold_accuracies = []
+    fold_precisions = []
+    fold_recs = []
+    fold_f1_scores = []
+    fold_aucs = []
+
+    # --- Initialize lists to store metrics across all folds for combined evaluation
+    all_val_labels_across_folds = []
+    all_val_preds_across_folds = []
+    all_val_probs_across_folds = [] # Store raw probabilities for overall AUC
+    # --- End of additions
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(all_sliced_data_list)), all_labels_for_skf)):
+        print(f"\n--- Fold {fold + 1}/{num_folds} for {model_type} ---")
+        train_data_list = [all_sliced_data_list[i] for i in train_idx]
+        val_data_list = [all_sliced_data_list[i] for i in val_idx]
+        train_labels_fold = [item[1] for item in train_data_list]
+        val_labels_fold = [item[1] for item in val_data_list]
+        print(f"    Train split label distribution (Fold {fold+1}): {Counter(train_labels_fold)}")
+        print(f"    Validation split label distribution (Fold {fold+1}): {Counter(val_labels_fold)}")
+        train_ds = BeeAudioDataset(train_data_list, feature_type=dataset_feature_type, augment=use_augmentation, sample_rate=SAMPLE_RATE, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS)
+        val_ds = BeeAudioDataset(val_data_list, feature_type=dataset_feature_type, augment=False, sample_rate=SAMPLE_RATE, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS)
+        NUM_DATALOADER_WORKERS = 0
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=NUM_DATALOADER_WORKERS, collate_fn=OversampleTransform() if oversample_minority else None, pin_memory=False)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=NUM_DATALOADER_WORKERS, pin_memory=False)
+        device = torch.device("cpu")
+        print(f"    Using device: {device}")
+        raw_audio_len_samples = int(current_segment_len_sec * SAMPLE_RATE)
+        # Model Instantiation based on type
+        if model_type == "LNN":
+            model = RawAudioLNN(
+                frame_size=FRAME_SIZE,
+                initial_proj_dim=model_params.get('initial_proj_dim_lnn', 32),
+                hidden_size_liquid=model_params.get('hidden_size_liquid', 16),
+                hidden_size_classifier=model_params.get('hidden_size_classifier_lnn', 32),
+                num_classes=NUM_CLASSES
+            ).to(device)
+        elif model_type == "LSTM":
+            model = MelAudioLSTM( # Changed to MelAudioLSTM
+                lstm_input_size=N_MELS, # LSTM input is N_MELS
+                lstm_hidden_size=model_params.get('lstm_hidden_size', 64),
+                num_classes=NUM_CLASSES
+            ).to(device)
+        elif model_type == "RNN":
+            model = RawAudioRNN(
+                frame_size=FRAME_SIZE,
+                initial_proj_dim=model_params.get('initial_proj_dim_rnn', 32),
+                rnn_hidden_size=model_params.get('rnn_hidden_size', 32),
+                num_classes=NUM_CLASSES
+            ).to(device)
+        elif model_type == "CNN":
+            model = MelAudioCNN( # Changed to MelAudioCNN
+                num_classes=NUM_CLASSES
+            ).to(device)
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+        # Pass feature_type to print_model_summary for correct input_size display
+        print_model_summary(model, (raw_audio_len_samples,), device, model_type, feature_type=dataset_feature_type)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        print(f"    Attempting to fetch first batch from train_loader (Fold {fold+1})...")
+        try:
+            first_inputs, first_labels = next(iter(train_loader))
+            print(f"    Successfully fetched first batch from train_loader. Inputs shape: {first_inputs.shape}, Labels shape: {first_labels.shape}")
+            _ = first_inputs.to(device)
+            _ = first_labels.long().to(device)
+            print(f"    Successfully moved first batch to device ({device}).")
+        except Exception as e:
+            print(f"    🛑 ERROR: Failed to fetch or move first batch! Error: {e}")
+            print(f"    This is a critical issue; please ensure your dataset path and data loading are correct.")
+            print(f"    Error details: {e}")
+            return
+        best_f1 = -1
+        epochs_no_improve = 0
+        best_model_path_this_fold = f"best_{model_type}_fold{fold+1}.pth"
+        for epoch in range(epochs):
+            loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+            metrics = evaluate(model, val_loader, device)
+            # --- Append fold metrics to overall lists
+            all_val_labels_across_folds.extend(metrics['labels'])
+            all_val_preds_across_folds.extend(metrics['preds'])
+            all_val_probs_across_folds.extend(metrics['probs'])
+            # ---
+            print(f"    Epoch {epoch+1:02d} | Loss: {loss:.4f} | Acc: {metrics['accuracy']:.4f} | "
+                  f"Prec: {metrics['precision']:.4f} | Rec: {metrics['recall']:.4f} | "
+                  f"F1: {metrics['f1']:.4f} | AUC: {metrics['auc']:.4f}")
+            if metrics['f1'] > best_f1:
+                best_f1 = metrics['f1']
+                epochs_no_improve = 0
+                torch.save(model.state_dict(), best_model_path_this_fold)
+            else:
+                epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"    Early stopping triggered after {epoch+1} epochs due to no improvement in F1 score.")
+                break
+        
+        # Load best model for final evaluation on this fold
+        model.load_state_dict(torch.load(best_model_path_this_fold, map_location=device))
+        fold_metrics = evaluate(model, val_loader, device) # Re-evaluate on best model
+        print(f"\n    Best F1 for Fold {fold+1}: {best_f1:.4f}")
+        print(f"    Fold {fold+1} Metrics (from best model):")
+        print(f"    Accuracy: {fold_metrics['accuracy']:.4f}")
+        print(f"    Precision: {fold_metrics['precision']:.4f}")
+        print(f"    Recall: {fold_metrics['recall']:.4f}")
+        print(f"    F1 Score: {fold_metrics['f1']:.4f}")
+        print(f"    AUC: {fold_metrics['auc']:.4f}")
+        fold_accuracies.append(fold_metrics['accuracy'])
+        fold_precisions.append(fold_metrics['precision'])
+        fold_recs.append(fold_metrics['recall'])
+        fold_f1_scores.append(fold_metrics['f1'])
+        fold_aucs.append(fold_metrics['auc'])
+        
+        # Plot confusion matrix for this fold only
+        print(f"    Plotting confusion matrix for Fold {fold+1}...")
+        # plot_confusion_matrix(fold_metrics['confusion_matrix'], CLASS_NAMES, title=f"{model_type} Confusion Matrix (Fold {fold+1})")
+        
+        if os.path.exists(best_model_path_this_fold):
+            os.remove(best_model_path_this_fold)
+
+    print("\n--- Cross-Validation Complete ---")
+    print(f"Mean Metrics across all {num_folds} folds:")
+    print(f"  Accuracy: {np.mean(fold_accuracies):.4f} (+/- {np.std(fold_accuracies):.4f})")
+    print(f"  Precision: {np.mean(fold_precisions):.4f} (+/- {np.std(fold_precisions):.4f})")
+    print(f"  Recall: {np.mean(fold_recs):.4f} (+/- {np.std(fold_recs):.4f})")
+    print(f"  F1 Score: {np.mean(fold_f1_scores):.4f} (+/- {np.std(fold_f1_scores):.4f})")
+    print(f"  AUC: {np.nanmean(fold_aucs):.4f} (+/- {np.nanstd(fold_aucs):.4f})")
+
+    # --- Calculate and plot cumulative confusion matrix
+    print("\n--- Calculating and plotting overall confusion matrix across all folds ---")
+    all_val_labels_across_folds = np.array(all_val_labels_across_folds)
+    all_val_preds_across_folds = np.array(all_val_preds_across_folds)
+    all_val_probs_across_folds = np.array(all_val_probs_across_folds)
+
+    final_cm = confusion_matrix(all_val_labels_across_folds, all_val_preds_across_folds)
+    
+    # Calculate overall AUC for the combined data
+    overall_auc = float('nan')
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UndefinedMetricWarning)
+        try:
+            # Check for binary case
+            if len(np.unique(all_val_labels_across_folds)) == 2:
+                if len(all_val_probs_across_folds.shape) > 1 and all_val_probs_across_folds.shape[1] > 1:
+                    overall_auc = roc_auc_score(all_val_labels_across_folds, all_val_probs_across_folds[:, 1], average='weighted')
+                else:
+                    print("Warning: Cannot calculate AUC. Not enough unique classes in combined labels.")
+            else:
+                overall_auc = roc_auc_score(all_val_labels_across_folds, all_val_probs_across_folds, multi_class='ovr', average='weighted', labels=np.arange(NUM_CLASSES))
+        except ValueError as e:
+            print(f"Warning: Could not calculate overall AUC. Error: {e}")
+            
+    print(f"\nOverall Metrics from combined validation data across all folds:")
+    print(f"  Overall Accuracy: {accuracy_score(all_val_labels_across_folds, all_val_preds_across_folds):.4f}")
+    print(f"  Overall F1 Score: {f1_score(all_val_labels_across_folds, all_val_preds_across_folds, average='weighted', zero_division=0):.4f}")
+    print(f"  Overall AUC: {overall_auc:.4f}")
+    
+    plot_confusion_matrix(final_cm, CLASS_NAMES, title=f"Overall {model_type} Confusion Matrix")
+
+    # Return metrics for possible external logging
+    return {
+        "mean_accuracy": np.mean(fold_accuracies),
+        "std_accuracy": np.std(fold_accuracies),
+        "mean_f1": np.mean(fold_f1_scores),
+        "std_f1": np.std(fold_f1_scores),
+        "overall_auc": overall_auc if 'overall_auc' in locals() else float('nan')
+    }
+
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    # Define experiments to run
+    experiments = {
+        "CNN": {
+            "epochs": 20,
+            "batch_size": 64,
+            "lr": 0.0005,
+            "use_augmentation": True
+        },
+        "LSTM": {
+            "epochs": 20,
+            "batch_size": 64,
+            "lr": 0.0005,
+            "use_augmentation": False # Augmenting Mel spectograms is more complex
+        },
+        "RNN": {
+            "epochs": 20,
+            "batch_size": 64,
+            "lr": 0.0005,
+            "use_augmentation": True
+        },
+        "LNN": {
+            "epochs": 20,
+            "batch_size": 64,
+            "lr": 0.0005,
+            "use_augmentation": True
+        }
+    }
+    
+    device = torch.device("cpu")
+    print(f"Using device: {device}")
+    
+    # Run each experiment
+    for model_name, params in experiments.items():
+        start_time = time.time()
+        try:
+            run_experiment(model_name, **params)
+        except ValueError as e:
+            print(f"Skipping experiment for {model_name} due to error: {e}")
+        end_time = time.time()
+        print(f"\n--- {model_name} Experiment Complete ---")
+        print(f"Total time for {model_name} experiment: {end_time - start_time:.2f} seconds ({ (end_time - start_time) / 60:.2f} minutes)")
