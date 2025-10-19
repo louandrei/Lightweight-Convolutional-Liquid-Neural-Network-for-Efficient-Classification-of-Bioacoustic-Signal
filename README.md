@@ -11,7 +11,7 @@ This repository contains the implementation of the **Hybrid Liquid Neural Networ
 **"Lightweight Convolutional Liquid Neural Network for Efficient Classification of Bioacoustic Signal"** (2025, Lou Andrei Rabanzo).
 
 The Hybrid LNN combines **1D convolutional feature extraction** with **liquid neurons** to efficiently classify **bee vs. no-bee audio recordings** directly from raw waveforms.  
-It achieves competitive performance with **very low parameter count (2,460)**, making it suitable for deployment on **resource-constrained devices**.
+It achieves competitive performance with **very low parameter count (~3000)**, making it suitable for deployment on **resource-constrained devices**.
 
 ---
 
