@@ -1,4 +1,6 @@
-# 🐝 Hybrid Liquid Neural Network for Bee/NoBee Classification
+# Lightweight Convolutional Liquid
+ Neural Network for Efficient
+ Classification of Bioacoustic Signals
 
 ![Python](https://img.shields.io/badge/python-3.9+-blue.svg)
 ![PyTorch](https://img.shields.io/badge/framework-PyTorch-red)
