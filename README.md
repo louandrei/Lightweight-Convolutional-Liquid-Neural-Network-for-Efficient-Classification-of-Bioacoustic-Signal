@@ -69,7 +69,7 @@ This will train and evaluate the Hybrid LNN using **5-fold cross-validation** an
 
 ## 📊 Dataset
 
-The model was evaluated on the ["To Bee or Not to Bee" dataset](https://www.kaggle.com/datasets/chrisfilo/to-bee-or-no-to-bee).
+The model was evaluated on the ["To Bee or Not to Bee" dataset](https://www.kaggle.com/datasets/chrisfilo/to-bee-or-no-to-bee) and https://www.kaggle.com/datasets/haithammoh/sounds-of-animals
 
 > Note: Dataset files are not included in this repository due to size. Please download and place them in your chosen `DATASET_PATH`.
 
