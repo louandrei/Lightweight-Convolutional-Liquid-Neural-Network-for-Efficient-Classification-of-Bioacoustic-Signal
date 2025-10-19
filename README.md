@@ -76,11 +76,13 @@ The model was evaluated on the ["To Bee or Not to Bee" dataset](https://www.kagg
 ---
 
 ## 📈 Results
+Bee Classification (h=40 and h=60)
+* **Accuracy:** ~95%
+* **F1-score:** ~95%
 
-* **Cross-validation accuracy:** ~85.19%
-* **Cross-validation F1-score:** ~83.98%
-* **Test accuracy:** ~89.57%
-* **Test F1-score:** ~89.58%
+Multi Animal classification (h=8)
+* **Accuracy:** ~85%
+* **F1-score:** ~85%
 
 The Hybrid LNN approaches CNN/LSTM performance while being >10x smaller in parameters.
 
