@@ -86,6 +86,8 @@ Multi Animal classification (h=8)
 * **Accuracy:** ~85%
 * **F1-score:** ~85%
 
+![Multi Animal Results](./multirestructured.png)
+
 The Hybrid LNN approaches CNN/LSTM performance while being >10x smaller in parameters.
 
 ---
