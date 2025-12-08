@@ -76,7 +76,7 @@ The model was evaluated on the ["To Bee or Not to Bee" dataset](https://www.kagg
 ---
 
 ## 📈 Results
-Bee Classification (h=40 and h=60)
+**Bee Classification (h=40 and h=60)**
 * **Accuracy:** ~95%
 * **F1-score:** ~95%
 
@@ -122,7 +122,7 @@ scalability for embedded bioacoustic monitoring applications.
 
 
 
-Multi Animal classification (h=8)
+**Multi Animal classification (h=8)**
 * **Accuracy:** ~85%
 * **F1-score:** ~85%
 
