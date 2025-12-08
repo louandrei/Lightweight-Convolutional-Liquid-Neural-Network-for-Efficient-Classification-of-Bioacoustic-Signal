@@ -7,7 +7,7 @@
 ---
 
 ## 📌 Overview
-This repository contains the implementation of the **Hybrid Liquid Neural Network (Hybrid LNN)** used in my Master's thesis:  
+This repository contains the implementation of the **Convolutional Liquid Neural Network (Hybrid LNN)** used in my Master's thesis:  
 **"Lightweight Convolutional Liquid Neural Network for Efficient Classification of Bioacoustic Signal"** (2025, Lou Andrei Rabanzo).
 
 The Hybrid LNN combines **1D convolutional feature extraction** with **liquid neurons** to efficiently classify **bee vs. no-bee audio recordings** directly from raw waveforms.  
