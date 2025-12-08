@@ -110,6 +110,14 @@ increases lead to lower returns, which shows that the hybrid convolutional–liq
 tecture already captures much of the important temporal–spectral information in bee
 sound signals.
 
+![CLNN Comparison](./CLNNcomparison.png)
+
+Comparison of model performance in Bee vs NoBee classification across
+architectures. The CLNN variants (h = 40 and h = 60) achieve near-parity in accuracy,
+F1-score, and AUC with conventional CNN and LSTM models while using an order
+of magnitude fewer parameters. This result demonstrates the model’s efficiency and
+scalability for embedded bioacoustic monitoring applications.
+
 
 
 
