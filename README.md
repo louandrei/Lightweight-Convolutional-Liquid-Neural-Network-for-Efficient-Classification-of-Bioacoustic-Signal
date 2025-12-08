@@ -82,6 +82,11 @@ Bee Classification (h=40 and h=60)
 
 ![Bee Results](./BEErestructured.png)
 
+The CLNN model (89.57% accuracy, 89.58% F1-score) significantly out-
+performs raw-audio baselines (RNN and LNN) by effectively combining convolutional
+feature extraction with liquid neuron dynamics, bridging the performance gap with high-
+performing spectrogram-based models (CNN and LSTM).
+
 Multi Animal classification (h=8)
 * **Accuracy:** ~85%
 * **F1-score:** ~85%
