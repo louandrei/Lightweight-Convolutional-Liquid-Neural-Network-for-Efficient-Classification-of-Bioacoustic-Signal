@@ -87,6 +87,14 @@ performs raw-audio baselines (RNN and LNN) by effectively combining convolutiona
 feature extraction with liquid neuron dynamics, bridging the performance gap with high-
 performing spectrogram-based models (CNN and LSTM).
 
+To acquire more understanding into the efficiency–accuracy trade-off in the proposed
+CLNN architecture, additional analysis was performed through adjusting the hidden-
+layer size (h). This scaling study provides insight into the effects of model capacity on
+learning stability, inference efficiency, and classification performance, thus identifying the
+configuration that increases representational power while reducing computational cost.
+
+
+
 Multi Animal classification (h=8)
 * **Accuracy:** ~85%
 * **F1-score:** ~85%
