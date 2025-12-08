@@ -102,6 +102,15 @@ too powerful for the dataset’s complexity. This pattern shows the best balance
 capacity and regularization, where the hybrid design gets the most representational power
 without overfitting.
 
+![Scaling Curve](./scaling curve 3.png)
+
+The scaling analysis indicates that the CLNN’s performance improvements
+come primarily from small improvements in the capacity of the hidden layer. More
+increases lead to lower returns, which shows that the hybrid convolutional–liquid archi-
+tecture already captures much of the important temporal–spectral information in bee
+sound signals.
+
+
 
 
 
