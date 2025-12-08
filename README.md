@@ -102,7 +102,7 @@ too powerful for the dataset’s complexity. This pattern shows the best balance
 capacity and regularization, where the hybrid design gets the most representational power
 without overfitting.
 
-![Scaling Curve](./scaling_curve_3.png)
+![Scaling Curve](./scalingcurve3.png)
 
 The scaling analysis indicates that the CLNN’s performance improvements
 come primarily from small improvements in the capacity of the hidden layer. More
