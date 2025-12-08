@@ -120,6 +120,12 @@ Multi Animal classification (h=8)
 
 ![Multi Animal Results](./multirestructured.png)
 
+The proposed CLNN model demonstrated improved generalization ability
+in the multi-class animal classification task. It gets the best overall performance (85.38%
+accuracy and 92.97% AUC) by using its combined convolutional and liquid parts to model
+both short- and long-range temporal dependencies in different types of raw audio inputs.
+This beats all spectrogram-based and raw-audio baselines.
+
 The Hybrid LNN approaches CNN/LSTM performance while being >10x smaller in parameters.
 
 ---
