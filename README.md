@@ -80,6 +80,8 @@ Bee Classification (h=40 and h=60)
 * **Accuracy:** ~95%
 * **F1-score:** ~95%
 
+![Bee Results](./BEErestructured.png)
+
 Multi Animal classification (h=8)
 * **Accuracy:** ~85%
 * **F1-score:** ~85%
