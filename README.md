@@ -93,6 +93,16 @@ layer size (h). This scaling study provides insight into the effects of model ca
 learning stability, inference efficiency, and classification performance, thus identifying the
 configuration that increases representational power while reducing computational cost.
 
+![CLNN Layer Scaling](./CLLNLayerScaling.png)
+
+As the h increases from 8 to 40, performance goes up quickly, then levels off at h=60.
+In this range (∼3.0–3.4k parameters), the CLNN model performs almost equally to the
+spectrogram-based CNN and LSTM models, even though it only needs about one-tenth of the parameters they require. Beyond h=80, improvements in accuracy tends to slow down and F1-scores go down a little, which relatively suggests that the model is maybe
+too powerful for the dataset’s complexity. This pattern shows the best balance between
+capacity and regularization, where the hybrid design gets the most representational power
+without overfitting.
+
+
 
 
 Multi Animal classification (h=8)
